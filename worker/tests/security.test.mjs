@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { build } from 'esbuild';
 
 // Bundle the actual Worker code and replace only the Cloudflare socket transport.
@@ -17,7 +18,7 @@ const built = await build({
 });
 const worker = await import('data:text/javascript;base64,' + Buffer.from(built.outputFiles[0].text).toString('base64'));
 const env = {
-  SESSION_SECRET: 's'.repeat(40), BOOTSTRAP_KEY: 'b'.repeat(40), AGENT_TOKEN: 'a'.repeat(40),
+  SESSION_SECRET: 's'.repeat(40), BOOTSTRAP_KEY: 'b'.repeat(40),
   APP_ORIGIN: 'https://monitor.example', DB: { prepare() { throw new Error('unexpected database call'); } }
 };
 
@@ -71,8 +72,108 @@ test('CSRF origin and agent bearer token are enforced', async () => {
   assert.equal(csrf.status, 400);
   const unauthorized = await worker.default.fetch(new Request('https://monitor.example/api/agent/heartbeat', {
     method: 'POST', headers: { Authorization: 'Bearer wrong', 'Content-Type': 'application/json' }, body: '{}'
-  }), env);
+  }), { ...env, DB: { prepare(sql) {
+    const statement = { bind() { return statement; }, async first() { return null; } };
+    return statement;
+  } } });
   assert.equal(unauthorized.status, 403);
+});
+
+test('probe credentials are individually authenticated and heartbeat identity cannot be spoofed', async () => {
+  const token = 'individual-probe-token-' + 'x'.repeat(32);
+  const digest = createHash('sha256').update(token).digest('base64url');
+  let heartbeatValues;
+  const db = {
+    prepare(sql) {
+      let values = [];
+      const statement = {
+        bind(...args) { values = args; return statement; },
+        async first() { return sql.startsWith('SELECT id FROM probes') && values[0] === digest ? { id: 'probe-owned' } : null; },
+        async run() {
+          if (sql.startsWith('INSERT INTO agent_heartbeats')) heartbeatValues = values;
+          return { meta: { changes: 1 } };
+        },
+      };
+      return statement;
+    },
+  };
+  const response = await worker.default.fetch(new Request('https://monitor.example/api/agent/heartbeat', {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_id: 'spoofed-id', metrics: { cpu: 1 }, certificates: [] }),
+  }), { ...env, DB: db });
+  assert.equal(response.status, 200);
+  assert.equal(heartbeatValues[0], 'probe-owned');
+  const wrong = await worker.default.fetch(new Request('https://monitor.example/api/agent/heartbeat', {
+    method: 'POST', headers: { Authorization: 'Bearer ' + 'y'.repeat(56), 'Content-Type': 'application/json' }, body: '{}'
+  }), { ...env, DB: db });
+  assert.equal(wrong.status, 403);
+});
+
+test('probe task lease can be consumed once and results are stored through the narrow API', async () => {
+  const token = 'individual-probe-token-' + 'q'.repeat(32);
+  const digest = createHash('sha256').update(token).digest('base64url');
+  const otherToken = 'individual-probe-token-' + 'r'.repeat(32);
+  const otherDigest = createHash('sha256').update(otherToken).digest('base64url');
+  const check = { id: 9, kind: 'https', url: 'https://status.example/', host: null, port: null, timeout_ms: 5000, expected_status: 200 };
+  let lease = null;
+  let completed = false;
+  const results = [];
+  const db = {
+    prepare(sql) {
+      let values = [];
+      const statement = {
+        bind(...args) { values = args; return statement; },
+        async all() {
+          if (sql.startsWith('SELECT c.id,c.kind,c.url,c.host,c.port,c.timeout_ms,c.expected_status')) return { results: [check] };
+          throw new Error(`unexpected all query: ${sql}`);
+        },
+        async first() {
+          if (sql.startsWith('SELECT id FROM probes')) return values[0] === digest ? { id: 'probe-a' } : values[0] === otherDigest ? { id: 'probe-b' } : null;
+          if (sql.startsWith('INSERT INTO probe_task_leases')) { lease = { check_id: values[0], probe_id: values[1], task_token: values[2], lease_until: values[3] }; completed = false; return { check_id: values[0] }; }
+          if (sql.startsWith('SELECT c.id,c.enabled,t.name,l.task_token')) {
+            return lease && !completed && values[0] === lease.check_id && values[1] === lease.probe_id && values[2] === lease.task_token
+              ? { id: check.id, enabled: 1, name: 'site', task_token: lease.task_token } : null;
+          }
+          if (sql.startsWith('SELECT ok FROM check_results')) return results.length ? { ok: results.at(-1)[1] } : null;
+          throw new Error(`unexpected first query: ${sql}`);
+        },
+        async run() {
+          if (sql.startsWith('UPDATE probe_task_leases SET completed_at')) {
+            if (!lease || completed || values[1] !== lease.check_id || values[2] !== lease.probe_id || values[3] !== lease.task_token) return { meta: { changes: 0 } };
+            completed = true;
+            return { meta: { changes: 1 } };
+          }
+          if (sql.startsWith('INSERT INTO check_results')) results.push(values);
+          return { meta: { changes: 1 } };
+        },
+      };
+      return statement;
+    },
+  };
+  const probeEnv = { ...env, DB: db };
+  const tasksResponse = await worker.default.fetch(new Request('https://monitor.example/api/probe/tasks?limit=10', {
+    headers: { Authorization: `Bearer ${token}` }
+  }), probeEnv);
+  assert.equal(tasksResponse.status, 200);
+  const tasks = (await tasksResponse.json()).tasks;
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].check.url, check.url);
+  assert.ok(tasks[0].task_token);
+
+  const submit = (authToken = token) => worker.default.fetch(new Request('https://monitor.example/api/probe/results', {
+    method: 'POST', headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ check_id: check.id, task_token: tasks[0].task_token, ok: true, latency_ms: 34, error: null }),
+  }), probeEnv);
+  const otherProbe = await submit(otherToken);
+  assert.equal(otherProbe.status, 400);
+  assert.equal(completed, false);
+  const accepted = await submit();
+  assert.equal(accepted.status, 200);
+  assert.equal(results.length, 1);
+  assert.equal(results[0][1], 1);
+  assert.equal(results[0][2], 34);
+  const duplicate = await submit();
+  assert.equal(duplicate.status, 400);
 });
 
 test('malformed passwords consume the per-IP-and-username login limit', async () => {
@@ -124,6 +225,7 @@ test('malformed passwords consume the per-IP-and-username login limit', async ()
 function certificateTestEnv(certificates) {
   const agentId = 'agent-test';
   const states = new Map();
+  const probeStates = new Map();
   let reported = certificates;
   const stateKey = (agent, hostname) => `${agent}\u0000${hostname}`;
   const db = {
@@ -140,11 +242,20 @@ function certificateTestEnv(certificates) {
               .filter(row => row.agent_id === values[0])
               .map(({ hostname, state }) => ({ hostname, state })) };
           }
+          if (sql.startsWith('SELECT hostname,state FROM certificate_probe_states')) {
+            return { results: [...probeStates.values()]
+              .filter(row => row.agent_id === values[0])
+              .map(({ hostname, state }) => ({ hostname, state })) };
+          }
           throw new Error(`unexpected all query: ${sql}`);
         },
         async first() {
           if (sql.startsWith('SELECT state FROM certificate_alert_states')) {
             const row = states.get(stateKey(values[0], values[1]));
+            return row ? { state: row.state } : null;
+          }
+          if (sql.startsWith('SELECT state FROM certificate_probe_states')) {
+            const row = probeStates.get(stateKey(values[0], values[1]));
             return row ? { state: row.state } : null;
           }
           throw new Error(`unexpected first query: ${sql}`);
@@ -157,6 +268,13 @@ function certificateTestEnv(certificates) {
             states.set(key, { agent_id, hostname, state, days_remaining, changed_at });
             return { meta: { changes: 1 } };
           }
+          if (sql.startsWith('INSERT OR IGNORE INTO certificate_probe_states')) {
+            const [agent_id, hostname, state, changed_at] = values;
+            const key = stateKey(agent_id, hostname);
+            if (probeStates.has(key)) return { meta: { changes: 0 } };
+            probeStates.set(key, { agent_id, hostname, state, changed_at });
+            return { meta: { changes: 1 } };
+          }
           if (sql.startsWith("UPDATE certificate_alert_states SET state='missing'")) {
             const [changed_at, agent_id, hostname, expectedState] = values;
             const key = stateKey(agent_id, hostname);
@@ -165,12 +283,28 @@ function certificateTestEnv(certificates) {
             states.set(key, { ...row, state: 'missing', days_remaining: null, changed_at });
             return { meta: { changes: 1 } };
           }
+          if (sql.startsWith("UPDATE certificate_probe_states SET state='missing'")) {
+            const [changed_at, agent_id, hostname, expectedState] = values;
+            const key = stateKey(agent_id, hostname);
+            const row = probeStates.get(key);
+            if (!row || row.state !== expectedState) return { meta: { changes: 0 } };
+            probeStates.set(key, { ...row, state: 'missing', changed_at });
+            return { meta: { changes: 1 } };
+          }
           if (sql.startsWith('UPDATE certificate_alert_states SET state=?')) {
             const [state, days_remaining, changed_at, agent_id, hostname, expectedState] = values;
             const key = stateKey(agent_id, hostname);
             const row = states.get(key);
             if (!row || row.state !== expectedState) return { meta: { changes: 0 } };
             states.set(key, { ...row, state, days_remaining, changed_at });
+            return { meta: { changes: 1 } };
+          }
+          if (sql.startsWith('UPDATE certificate_probe_states SET state=?')) {
+            const [state, changed_at, agent_id, hostname, expectedState] = values;
+            const key = stateKey(agent_id, hostname);
+            const row = probeStates.get(key);
+            if (!row || row.state !== expectedState) return { meta: { changes: 0 } };
+            probeStates.set(key, { ...row, state, changed_at });
             return { meta: { changes: 1 } };
           }
           throw new Error(`unexpected run query: ${sql}`);
@@ -182,6 +316,7 @@ function certificateTestEnv(certificates) {
   return {
     env: { ...env, DB: db, NOTIFY_WEBHOOK_URL: 'https://webhook.example/alerts', CERT_EXPIRY_ALERT_DAYS: '30' },
     states,
+    probeStates,
     setCertificates(next) { reported = next; },
     stateKey,
     agentId,
@@ -271,8 +406,16 @@ test('failed certificate webhook is best-effort and does not break monitor state
   }
 });
 
-test('TCP connect failure is not reported as up', async () => {
-  const result = await worker.tcpConnectProbe('example.com', 443, 1000);
-  assert.equal(result.ok, false);
-  assert.match(result.error, /unavailable/);
+test('certificate probe validation failures alert once and recover when a valid certificate returns', async () => {
+  await withFakeWebhook(async sent => {
+    const data = certificateTestEnv([{ hostname: 'example.com', error: 'certificate_verification_failed' }]);
+    assert.equal(await worker.monitorCertificates(data.env), 1);
+    assert.equal(sent.at(-1).type, 'certificate_probe_failed');
+    assert.equal(sent.at(-1).error, 'certificate_verification_failed');
+    assert.equal(await worker.monitorCertificates(data.env), 0);
+    data.setCertificates([certificate('example.com', 90)]);
+    assert.equal(await worker.monitorCertificates(data.env), 1);
+    assert.equal(sent.at(-1).type, 'certificate_probe_recovered');
+    assert.equal(await worker.monitorCertificates(data.env), 0);
+  });
 });

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, dependency-free heartbeat agent for SentryCloud Monitor."""
+"""Outbound-only probe agent for SentryCloud Monitor."""
 from __future__ import annotations
 
 import json
@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
 from cert_probe import probe_certificates
+from probe_checks import run_check
 
 
 @dataclass(frozen=True)
@@ -29,14 +30,16 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         url = os.environ.get("SENTRY_AGENT_URL", "").strip()
-        # AGENT_TOKEN is the Worker API contract. Accept the old variable as a
-        # migration fallback so an existing installation does not silently stop.
+        # Each registered probe receives its own token; there is no shared
+        # project-wide agent secret in the new control-plane protocol.
         token = os.environ.get("AGENT_TOKEN", os.environ.get("SENTRY_AGENT_TOKEN", ""))
         agent_id = os.environ.get("AGENT_ID", "").strip()
         if not url:
             raise ValueError("SENTRY_AGENT_URL is required")
         if not token:
             raise ValueError("AGENT_TOKEN is required")
+        if len(token) < 32:
+            raise ValueError("AGENT_TOKEN must be at least 32 characters")
         if not agent_id:
             raise ValueError("AGENT_ID is required")
         try:
@@ -133,12 +136,36 @@ def _is_local(url: str) -> bool:
         return False
 
 
-def send_heartbeat(config: Config, metrics: Dict[str, Any], opener: Callable = urllib.request.urlopen) -> None:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _safe_urlopen(request, timeout):
+    # A control-plane redirect must not forward a probe's bearer token.
+    return urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout)
+
+
+def _validate_control_url(config: Config) -> urllib.parse.SplitResult:
+    try:
+        parsed = urllib.parse.urlsplit(config.url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid SENTRY_AGENT_URL") from exc
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise ValueError("invalid SENTRY_AGENT_URL")
+    if parsed.scheme == "https":
+        if port not in (None, 443):
+            raise ValueError("HTTPS control endpoint must use port 443")
+    elif not (parsed.scheme == "http" and config.insecure_local and _is_local(config.url)):
+        raise ValueError("HTTPS is required (HTTP is permitted only for explicitly enabled local testing)")
+    return parsed
+
+
+def send_heartbeat(config: Config, metrics: Dict[str, Any], opener: Callable = _safe_urlopen) -> None:
     if not config.agent_id:
         raise ValueError("AGENT_ID is required")
-    parsed = urllib.parse.urlparse(config.url)
-    if parsed.scheme != "https" and not (parsed.scheme == "http" and config.insecure_local and _is_local(config.url)):
-        raise ValueError("HTTPS is required (HTTP is permitted only for explicitly enabled local testing)")
+    _validate_control_url(config)
     # Keep this shape stable: the Worker heartbeat endpoint consumes exactly
     # these three fields. In particular, certificates is always an array.
     payload = {"agent_id": config.agent_id, "metrics": metrics,
@@ -152,8 +179,50 @@ def send_heartbeat(config: Config, metrics: Dict[str, Any], opener: Callable = u
             raise urllib.error.HTTPError(config.url, response.status, "heartbeat rejected", response.headers, None)
 
 
+def _api_url(config: Config, path: str) -> str:
+    parsed = _validate_control_url(config)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _api_json(config: Config, path: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None,
+              opener: Callable = _safe_urlopen) -> Any:
+    data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
+    headers = {"Authorization": "Bearer " + config.token, "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(_api_url(config, path), data=data, headers=headers, method=method)
+    with opener(request, timeout=config.timeout) as response:
+        if not 200 <= response.status < 300:
+            raise urllib.error.HTTPError(request.full_url, response.status, "probe API rejected", response.headers, None)
+        raw = response.read()
+        return json.loads(raw) if raw else {}
+
+
+def poll_and_run_tasks(config: Config, opener: Callable = _safe_urlopen,
+                       check_runner: Callable[[Dict[str, Any]], Dict[str, Any]] = run_check) -> int:
+    response = _api_json(config, "/api/probe/tasks?limit=20", opener=opener)
+    tasks = response.get("tasks", []) if isinstance(response, dict) else []
+    if not isinstance(tasks, list):
+        raise ValueError("invalid task response")
+    completed = 0
+    for task in tasks:
+        if not isinstance(task, dict) or not isinstance(task.get("check"), dict):
+            continue
+        result = check_runner(task["check"])
+        payload = {
+            "check_id": task["check"].get("id"),
+            "task_token": task.get("task_token"),
+            "ok": bool(result.get("ok")),
+            "latency_ms": result.get("latency_ms", 0),
+            "error": result.get("error"),
+        }
+        _api_json(config, "/api/probe/results", method="POST", payload=payload, opener=opener)
+        completed += 1
+    return completed
+
+
 def run(config: Config, sleep: Callable[[float], None] = time.sleep,
-        opener: Callable = urllib.request.urlopen, proc_root: str = "/proc", root: str = "/") -> None:
+        opener: Callable = _safe_urlopen, proc_root: str = "/proc", root: str = "/") -> None:
     stopping = False
     def stop(_signum, _frame):
         nonlocal stopping
@@ -166,8 +235,11 @@ def run(config: Config, sleep: Callable[[float], None] = time.sleep,
             metrics, cpu_state = collect_metrics(proc_root, root, cpu_state)
             send_heartbeat(config, metrics, opener)
         except (OSError, ValueError, urllib.error.URLError, urllib.error.HTTPError) as exc:
-            # Deliberately omit URL/token/details that could contain credentials.
             print("heartbeat/collection failed: " + type(exc).__name__, file=sys.stderr)
+        try:
+            poll_and_run_tasks(config, opener)
+        except (OSError, ValueError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+            print("probe task cycle failed: " + type(exc).__name__, file=sys.stderr)
         if not stopping:
             sleep(config.interval)
 

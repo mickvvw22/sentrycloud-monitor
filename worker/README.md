@@ -1,44 +1,41 @@
 # SentryCloud Monitor Worker
 
-原创 Cloudflare Workers + D1 后端 MVP。**未经过外部安全审计，未达到生产就绪标准。**
+原创 Cloudflare Workers + D1 控制面。**未经过外部安全审计，仍不是生产就绪软件。** Worker 管理用户、TOTP、目标/检查配置、任务租约、历史与告警；它不再直接访问监控目标的 HTTP、HTTPS 或 TCP 端口。
 
-## 配置
-
-必须设置：
+## 必需配置
 
 - `DB`：D1 binding。
-- `SESSION_SECRET`、`BOOTSTRAP_KEY`、`AGENT_TOKEN`：各至少 32 字符的高熵随机 secret；缺失或过短时除 `/health` 外 fail-closed。
-- `APP_ORIGIN`：唯一允许的前端 origin；不配置不会启用任意来源 CORS。
+- `SESSION_SECRET`、`BOOTSTRAP_KEY`：各至少 32 字符的高熵随机 secret。
+- `APP_ORIGIN`：唯一前端 origin；不配置不会启用任意来源 CORS。
+- 可选：`CERT_EXPIRY_ALERT_DAYS`（默认 30，范围 1–365）、`NOTIFY_WEBHOOK_URL`、`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`。
 
-可选配置：
+不再需要全局 `AGENT_TOKEN`。每台 Linux 探测器由管理员单独注册，Worker 仅存令牌 SHA-256 摘要，可逐台撤销。探测器以 HTTPS 主动拉取任务，因此无需开放探测器入站端口，也不向探测器提供 Cloudflare API、D1 或通知渠道凭据。
 
-- `CERT_EXPIRY_ALERT_DAYS`：证书临期提醒阈值，默认 30 天；有效范围为 1–365 天。
-- `NOTIFY_WEBHOOK_URL`、`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`：告警通知目的地。
+新建数据库使用 `schema.sql`。已有数据库依次按原项目升级说明完成证书列/证书告警状态迁移后，再执行一次 `migration-probe-security.sql`，创建 `probes`、`probe_task_leases` 与 `certificate_probe_states`。先备份 D1；不要把迁移文件当作可重复全量重置操作。
 
-新建数据库使用 `schema.sql` 初始化。已有旧版数据库：如果 `agent_heartbeats` 缺少 `certificates` 列，先运行一次 `migration-certificates.sql`；再运行一次 `migration-certificate-alerts.sql` 创建证书状态表。不要对已有 `certificates` 列的数据库重复执行旧列迁移。
+## 认证与端点
 
-## 端点
-
-- `GET /health`：无需应用密钥，仅返回存活状态。
+- `GET /health`：无需应用密钥，只返回存活状态。
 - `POST /api/bootstrap`：body `{key, username, password}`，仅空库；密码至少 12 字符，要求同源 `Origin`。
-- `POST /api/login`：body `{username,password,totp?}`，要求同源 `Origin`。按 `IP+username` 的 D1 窗口限制最多 10 次/15 分钟；包括缺失或格式错误的口令，超限返回 HTTP 429。这是基础限速，不替代 WAF 或更强的全局防暴力控制。
-- `GET /api/me`、`POST /api/logout`。
-- `POST /api/totp/setup`：已启用 TOTP 时拒绝，不覆盖现有启用配置。
-- `POST /api/totp/enable`：body `{code}`。
-- `POST /api/totp/disable`：body `{password,code}`，同时要求密码和当前 TOTP。
-- `GET /api/agents`：管理员 session 认证，返回 heartbeat metrics、certificates 与时间。
-- `POST /api/agent/heartbeat`：不依赖 admin cookie，仅要求 `Authorization: Bearer AGENT_TOKEN`；body `{agent_id,metrics,certificates?}`。
-- `GET/POST /api/targets`、`DELETE /api/targets/:id`：需要管理员 session。
-- `GET/POST /api/targets/:id/checks`、`PATCH/DELETE /api/checks/:id`：需要管理员 session；`interval_seconds` 支持 60 秒至 365 天。
-- `GET /api/checks/:id/latest|history`：需要管理员 session。
-- `POST /api/cron/monitor`：要求管理员 session、同源 `Origin` 和 `x-cron-key: BOOTSTRAP_KEY`；同时支持 Workers Cron `scheduled` handler。
+- `POST /api/login`：body `{username,password,totp?}`，要求同源 `Origin`；按 `IP+username` 限速最多 10 次/15 分钟。仍需要外层 Access/MFA 与更强防暴力保护。
+- `GET /api/me`、`POST /api/logout`；管理员 cookie 为 Secure、HttpOnly、SameSite=Strict。
+- `POST /api/totp/setup|enable|disable`：启用 TOTP 后不允许无验证覆盖密钥；停用要求密码与当前 TOTP。
+- `POST /api/probes`（管理员 session、同源 `Origin`）：body `{name}`。创建独立探测器并仅一次返回 `{id,name,token}`；token 不可查询回。
+- `GET /api/probes`（管理员 session）：列出探测器名称、上线时间、撤销状态，不含令牌。
+- `DELETE /api/probes/:id`（管理员 session、同源 `Origin`）：撤销该探测器令牌。
+- `POST /api/agent/heartbeat`：探测器 bearer token 认证；探测器身份来自令牌，不接受请求体 `agent_id` 冒充其他机器。body `{agent_id,metrics,certificates}` 中的 `agent_id` 会被忽略，以已认证 ID 为准。
+- `GET /api/probe/tasks?limit=10`：逐机 bearer 认证，最多返回 20 个到期检查及随机短期 `task_token`。任务由条件写入租约领取；已有有效租约不会重复发给其他探测器，超时后可重派。
+- `POST /api/probe/results`：逐机 bearer 认证；body `{check_id,task_token,ok,latency_ms,error}`。仅当前探测器持有、未过期且未消费的租约可提交，结果由 Worker 时间戳记录，重放被拒绝。
+- `GET /api/agents`：管理员查看心跳、主机指标和证书结果。
+- `GET/POST /api/targets`、`DELETE /api/targets/:id`；`GET/POST /api/targets/:id/checks`、`PATCH/DELETE /api/checks/:id`；`GET /api/checks/:id/latest|history`：均需要管理员 session。
+- `POST /api/cron/monitor`：要求管理员 session、同源 `Origin` 和 `x-cron-key: BOOTSTRAP_KEY`；仅扫描证书告警。Workers Cron 也只执行该证书扫描，不会自行探测 HTTP/TCP。
 
-## 证书告警与安全范围
+## 网络安全与探测职责
 
-采集器上报可验证证书的 `expires_at` 后，Worker 会按 `CERT_EXPIRY_ALERT_DAYS` 计算 `ok`、`warning` 或 `expired` 状态；同一主机重复上报时按最早到期时间评估。初次发现临期/过期状态时告警；条件写入避免并发监控重复提醒；显式上报列表中消失的主机标记为 `missing`（不视为恢复），重新出现后重新评估。续期后回到安全窗口时发送恢复通知。证书探测失败或无效证书可能无法提供到期时间，因此不会伪造有效到期信息。Webhook 和 Telegram 通知均为尽力而为，没有重试队列。
+检查目标由管理员配置；Worker 校验 URL scheme、标准端口、userinfo、IP literal 和常见本地域名，但不执行任何针对目标的出站请求。独立 Python 探测器对每个 HTTP/HTTPS/TCP/证书连接重新解析 DNS；拒绝所有非公网/特殊地址，并固定套接字到已验证 IP，HTTP `Host`、TLS SNI 与证书校验仍使用域名。每个重试和 HTTP 重定向都重新解析并验证。HTTPS 用系统 CA 与主机名验证，证书验证失败以明确错误回传并可告警。
 
-密码使用 PBKDF2-HMAC-SHA-256（新建密码使用 100,000 iterations，以兼容 Cloudflare Workers 生产环境的上限）；这是运行时兼容折中，不能宣称满足当前密码存储强度标准。`passwordVerify` 按存储哈希中的 iteration 校验，保持既有 `pbkdf2$iterations$salt$hash` 格式兼容，不静默降级旧哈希。生产环境必须在外层配置 Cloudflare Access/MFA，并进行专业安全审计；不要仅依赖此 Worker 的密码保护。Session 使用带过期时间的 HMAC-SHA-256 token，当前没有服务端主动撤销机制。状态变更的 cookie 请求必须带与 `APP_ORIGIN` 完全匹配的 `Origin`；CORS 不回退到任意 origin。
+此设计降低 Worker SSRF 和共享凭证泄漏风险，但不是完整网络安全边界：探测器主机上的系统解析器、出站防火墙、目标端、Cloudflare、管理员账号与通知目的地都需单独审计。应使用专用低权限 Linux 账号、只读程序文件、受保护的配置文件与主机级出站限制；不要让不可信用户修改探测任务或探测器配置。TCP 允许除 25 外的有效端口，因此出站网络策略要按实际被授权的目标收紧。
 
-HTTP endpoint 只允许 HTTP/HTTPS、80/443、无 userinfo，并拒绝 URL 标准化后及常见数字表示的 IPv4/IPv6 literal、localhost；手动重定向每一跳都重新校验。Cloudflare Workers 无通用 DNS 解析/固定出站 IP API，因此这里不能完全消除 DNS rebinding 或网络层 SSRF 风险：校验域名后，DNS 仍可能在连接时解析到私网地址。生产部署必须配合出站隔离、域名 allowlist 或 egress proxy，并进行外部审计。TCP 检查使用官方 `cloudflare:sockets` 的 `connect()`，等待 `socket.opened` 后判定成功，带超时并在 `finally` 关闭 socket；连接失败、超时、Cloudflare 禁止的目标/端口等都如实记为 down，不伪造 up。应用拒绝 localhost、IP literal、userinfo、常见私有主机名风险、端口 25 和非法端口；Cloudflare 平台自身对目标地址/端口的限制仍可能导致合法配置无法连接。
+证书有效期状态仍为 `ok`、`warning`、`expired`、`missing`；新表 `certificate_probe_states` 单独追踪 TLS 验证/网络/危险 DNS 等探测错误，并在状态变化时去重告警，重新成功时发送恢复通知。证书条目从列表消失只标记 `missing`，不会误报恢复。通知为尽力而为，没有重试队列。历史检查结果目前没有自动清理策略。
 
-所有采集器当前共用一个 agent token；尚无逐机器令牌隔离。历史检测数据没有自动保留/清理策略，长期运行会持续占用 D1 存储与查询资源。定时触发、外部网络行为和生产通知尚未在真实 Cloudflare 环境验证。
+登录密码仍使用 PBKDF2-HMAC-SHA-256 100,000 次迭代以兼容运行时，低于推荐强度；Session 暂无服务端主动撤销。生产环境须先配置 Access/MFA、出站与入站网络限制、备份与留存策略，并完成独立安全审计。平台定时行为、实际目标连通性、证书告警和生产通知尚未在真实 Cloudflare 环境验证。

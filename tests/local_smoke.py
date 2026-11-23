@@ -28,7 +28,6 @@ vars_file = ROOT / '.dev.vars'
 values = dict(line.split('=', 1) for line in vars_file.read_text().splitlines() if '=' in line)
 assert values.get('APP_ORIGIN') == BASE, 'Only the explicitly configured localhost origin is allowed.'
 bootstrap_key = values['BOOTSTRAP_KEY']
-agent_token = values['AGENT_TOKEN']
 password = secrets.token_urlsafe(24)
 username = 'local-test-' + secrets.token_hex(6)
 cookie = None
@@ -100,43 +99,46 @@ request('POST', '/api/totp/disable', {'password': password, 'code': code_for(set
 assert request('GET', '/api/me')['user']['totp_enabled'] is False
 print('PASS: bootstrap, login, origin check, TOTP enable/login/disable')
 
+probe = request('POST', '/api/probes', {'name': 'local-smoke-probe'}, expected=(201,))
+cert_probe = request('POST', '/api/probes', {'name': 'local-smoke-cert-probe'}, expected=(201,))
 request('POST', '/api/agent/heartbeat', {'agent_id': 'local-test', 'metrics': {}}, expected=(400, 403))
 sys.path.insert(0, str(ROOT / 'agent'))
-from agent import Config, collect_metrics, send_heartbeat
+from agent import Config, collect_metrics, poll_and_run_tasks, send_heartbeat
 metrics, _ = collect_metrics()
-send_heartbeat(Config(url=BASE + '/api/agent/heartbeat', token=agent_token,
-                      insecure_local=True, agent_id='local-test'), metrics)
+local_config = Config(url=BASE + '/api/agent/heartbeat', token=probe['token'],
+                      insecure_local=True, agent_id=probe['id'])
+send_heartbeat(local_config, metrics)
 rows = request('GET', '/api/agents')['results']
-assert any(r['agent_id'] == 'local-test' and 'memory' in json.loads(r['metrics']) for r in rows)
+assert any(r['agent_id'] == probe['id'] and 'memory' in json.loads(r['metrics']) for r in rows)
 cert_expiry_soon = (datetime.now(timezone.utc) + timedelta(days=15)).isoformat().replace('+00:00', 'Z')
 cert_expiry_later = (datetime.now(timezone.utc) + timedelta(days=60)).isoformat().replace('+00:00', 'Z')
-request('POST', '/api/agent/heartbeat', {'agent_id': 'cert-test', 'metrics': {},
+request('POST', '/api/agent/heartbeat', {'agent_id': 'spoofed-cert-id', 'metrics': {},
     'certificates': [
         {'hostname': 'example.com', 'expires_at': cert_expiry_soon},
         {'hostname': 'EXAMPLE.COM', 'expires_at': cert_expiry_later},
     ]},
-    headers={'Authorization': 'Bearer ' + agent_token})
+    headers={'Authorization': 'Bearer ' + cert_probe['token']})
 rows = request('GET', '/api/agents')['results']
-assert any(r['agent_id'] == 'cert-test' and json.loads(r['certificates'])[0]['hostname'] == 'example.com' for r in rows)
+assert any(r['agent_id'] == cert_probe['id'] and json.loads(r['certificates'])[0]['hostname'] == 'example.com' for r in rows)
 alert_result = request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})
 assert alert_result['certificate_alerts'] == 1, 'near-expiry certificate did not trigger one alert'
 assert any(e.get('type') == 'certificate_expiring' and e.get('hostname') == 'example.com' for e in events), 'near-expiry webhook not delivered'
 assert request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})['certificate_alerts'] == 0, 'repeated cron duplicated an unchanged alert'
 
-request('POST', '/api/agent/heartbeat', {'agent_id': 'cert-test', 'metrics': {}, 'certificates': []},
-        headers={'Authorization': 'Bearer ' + agent_token})
+request('POST', '/api/agent/heartbeat', {'agent_id': cert_probe['id'], 'metrics': {}, 'certificates': []},
+        headers={'Authorization': 'Bearer ' + cert_probe['token']})
 assert request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})['certificate_alerts'] == 0
 assert not any(e.get('type') == 'certificate_recovered' for e in events), 'missing certificate was incorrectly reported as recovered'
-request('POST', '/api/agent/heartbeat', {'agent_id': 'cert-test', 'metrics': {},
+request('POST', '/api/agent/heartbeat', {'agent_id': cert_probe['id'], 'metrics': {},
     'certificates': [{'hostname': 'example.com', 'expires_at': cert_expiry_soon}]},
-    headers={'Authorization': 'Bearer ' + agent_token})
+    headers={'Authorization': 'Bearer ' + cert_probe['token']})
 assert request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})['certificate_alerts'] == 1
 assert sum(e.get('type') == 'certificate_expiring' for e in events) == 2, 'reappearing warning certificate was not re-alerted'
 
 cert_expiry_renewed = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat().replace('+00:00', 'Z')
-request('POST', '/api/agent/heartbeat', {'agent_id': 'cert-test', 'metrics': {},
+request('POST', '/api/agent/heartbeat', {'agent_id': cert_probe['id'], 'metrics': {},
     'certificates': [{'hostname': 'example.com', 'expires_at': cert_expiry_renewed}]},
-    headers={'Authorization': 'Bearer ' + agent_token})
+    headers={'Authorization': 'Bearer ' + cert_probe['token']})
 assert request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})['certificate_alerts'] == 1
 assert any(e.get('type') == 'certificate_recovered' and e.get('hostname') == 'example.com' for e in events), 'certificate renewal webhook not delivered'
 print('PASS: rejected unauthorized agent, real local metrics heartbeat, certificate payload persisted')
@@ -150,10 +152,16 @@ tcp_check = request('POST', f'/api/targets/{tid}/checks', {'kind': 'tcp', 'host'
 result = request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})
 http_history = request('GET', f"/api/checks/{http_check['id']}/history")['results']
 tcp_history = request('GET', f"/api/checks/{tcp_check['id']}/history")['results']
-assert http_history, 'HTTP cron produced no history'
-assert tcp_history, 'TCP cron produced no history'
+assert not http_history, 'Worker must not probe HTTP targets directly'
+assert not tcp_history, 'Worker must not probe TCP targets directly'
+completed = poll_and_run_tasks(local_config)
+assert completed == 2, f'probe did not receive both due checks: {completed}'
+http_history = request('GET', f"/api/checks/{http_check['id']}/history")['results']
+tcp_history = request('GET', f"/api/checks/{tcp_check['id']}/history")['results']
+assert http_history, 'outbound probe produced no HTTP history'
+assert tcp_history, 'outbound probe produced no TCP history'
 assert all(item['ok'] in (0, 1) for item in http_history + tcp_history)
-print(f"PASS: real scheduled HTTP/TCP check records (HTTP={http_history[0]['ok']}, TCP={tcp_history[0]['ok']}); observed status depends on network")
+print(f'PASS: outbound probe HTTP/TCP records (HTTP={http_history[0]["ok"]}, TCP={tcp_history[0]["ok"]}); observed status depends on network')
 assert request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})['checked'] == 0
 assert any(e.get('check_id') == http_check['id'] and e.get('ok') is False for e in events), 'initial failure alert not delivered to local receiver'
 databases = list((ROOT / '.wrangler/local-integration/v3/d1').rglob('*.sqlite'))
@@ -161,7 +169,7 @@ assert len(databases) == 1, 'Expected exactly one disposable local D1 database'
 with sqlite3.connect(databases[0]) as db:
     db.execute('UPDATE checks SET expected_status=200 WHERE id=?', (http_check['id'],))
     db.execute("UPDATE check_results SET checked_at='2000-01-01T00:00:00.000Z' WHERE check_id=?", (http_check['id'],))
-request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})
+assert poll_and_run_tasks(local_config) == 1
 http_history = request('GET', f"/api/checks/{http_check['id']}/history")['results']
 assert http_history[0]['ok'] == 1, 'example.com did not return expected HTTP status during recovery test'
 assert any(e.get('check_id') == http_check['id'] and e.get('ok') is True for e in events), 'recovery alert not delivered to local receiver'

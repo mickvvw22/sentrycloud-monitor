@@ -1,44 +1,34 @@
 # SentryCloud Monitor
 
-独立编写的服务器与域名监控开发版：自适应深色仪表盘、Cloudflare Workers + D1 后端，以及可选 Linux Python 采集器。本项目使用原创代码，未使用 CF-Server-Monitor-Pro 的源代码；目前仍未部署到 Cloudflare。
+原创服务器与域名监控开发项目：深色仪表盘、Cloudflare Workers + D1 控制面，以及可选 Linux Python 探测器。本项目没有使用 CF-Server-Monitor-Pro 源代码。目前未部署到 Cloudflare，也没有更改 Cloudflare、DNS 或任何云资源。
 
-## 已实现
+## 功能
 
-- HTTP/HTTPS 与 TCP 定时检查、响应时间和历史记录；检查频率可配置，Cloudflare Cron 模板设为每分钟。
-- Linux 采集器上报 CPU、内存、磁盘、累计网络流量和运行时间。
-- 可选 TLS 证书探测、到期状态展示，以及默认在到期 30 天内和证书过期时的告警；续期回到安全窗口后发送恢复通知。阈值可通过 `CERT_EXPIRY_ALERT_DAYS` 设为 1–365 天。
-- 管理员密码登录，可选 TOTP：在 Google Authenticator 中手动输入密钥绑定；当前不生成二维码。
-- 目标故障/恢复以及证书临期、过期、续期恢复通知支持 webhook 或 Telegram；同一状态不重复提醒，采集列表中暂时缺报的证书重新出现时会再次评估；通知为尽力而为。
-- Wrangler 本地配置、D1 表结构与自动化测试；`wrangler.toml` 中的数据库 ID 是占位符，并非真实云资源。
+通过逐机注册、可单独撤销的探测器，保留 HTTP/HTTPS 与 TCP 定时检查、响应时间、历史记录和状态变化通知。Worker 只存配置、派发带短期租约的任务、接收结果并保存历史；它不再直接访问用户配置的站点或 TCP 地址。探测器只主动向 Worker 建立 HTTPS 连接，不需开放入站端口。
 
-## 未完成或有局限
+探测器上报 CPU、内存、磁盘、累计网络流量和运行时间；可选检查 TLS 证书有效期。到期阈值默认为 30 天，可通过 `CERT_EXPIRY_ALERT_DAYS` 设为 1–365 天。临期、过期、续期恢复以及证书验证/网络探测失败和恢复均可经 webhook 或 Telegram 告警；告警尽力而为，没有通知重试队列。
 
-这是**未经过专业安全审计的开发版，不应直接部署到生产**。上线前需要配置 Cloudflare Access / MFA 和适当网络隔离，审计认证与会话、限制管理员和采集器权限，并验证账号、额度和运行环境。尚未在 Cloudflare 创建资源或完成实际部署。
+管理员密码登录支持可选 TOTP，可在 Google Authenticator 中手动输入密钥绑定（暂不生成二维码）。项目包含 D1 schema、数据库迁移、Wrangler 本地配置和自动化测试；`wrangler.toml` 数据库 ID 是占位符。
 
-- Cloudflare Workers 对密码派生的限制使本项目使用 PBKDF2-SHA-256 100,000 次迭代，这是兼容性折中，不应仅依赖此密码保护；还需要更完善的防暴力破解与密钥保护。
-- DNS 重绑定等出站风险未彻底解决；HTTP 检查限制端口 80/443。Workers TCP 接口也限制私网、Cloudflare IP、端口 25 等目标，实际可连接性取决于平台。
-- 证书到期提醒依赖采集器成功读取有效的 `expires_at`；无效证书或探测失败可能无法得知到期时间。通知没有重试队列；Webhook 在本地模拟器中测试过，Telegram 及真实生产通知未测试。
-- 所有采集器共用一个 token；尚无逐机器令牌隔离、历史指标保留策略或公开状态页。管理员 session 没有服务端主动撤销功能。
-- 本地计划任务通过手动触发测试过；未在 Cloudflare 验证实际部署、自动定时或实时告警。TOTP 绑定用程序生成的标准代码验证过，但未在用户手机上实测。
+## 安全架构与未完成事项
+
+探测器逐次解析全部 DNS A/AAAA 地址，发现任何非公网、特殊、私网、回环、链路本地、共享/CGNAT、组播、保留或文档地址就 fail-closed；实际连接固定到已校验的数值 IP，HTTPS 保留域名用于 Host、SNI、CA 链与主机名验证。每次重试、重定向都重新解析并检查。证书验证失败会作为独立错误保存和告警。
+
+这仍是**未经过专业安全审计的开发版，不应直接部署到生产**。需要 Cloudflare Access/MFA、探测器主机最低权限和 egress 防火墙、D1 备份/保留策略及生产环境验证。管理员仍使用 PBKDF2-SHA-256 100,000 次迭代（运行时兼容折中），登录限速基础，session 没有服务端主动撤销。外部定时触发、主机连通性、真实证书告警与通知尚未在 Cloudflare 生产环境验证，Telegram 和生产 webhook 也未测试。
 
 ## 本地开发
 
-以下命令仅适用于独立测试目录及一次性本地数据库，**不要对包含真实数据的数据库运行测试**。需要 Node.js、npm 和 Python 3；`wrangler.toml` 的 `workers_dev = false` 也不代表可以绕过部署授权。
+以下流程仅适用于一次性本地 D1 和测试数据；不要对含真实数据的数据库运行集成 Smoke 测试。需要 Node.js、npm、Python 3。
 
-1. 安装 Worker 测试依赖：`cd worker && npm ci`。
-2. 回到项目根目录，在 `.dev.vars` 创建 `SESSION_SECRET`、`BOOTSTRAP_KEY`、`AGENT_TOKEN` 三个彼此不同、各至少 32 字符的随机值，以及 `APP_ORIGIN=http://127.0.0.1:8787`。不要提交该文件。可选设置 `CERT_EXPIRY_ALERT_DAYS=30` 和 `NOTIFY_WEBHOOK_URL=http://127.0.0.1:8788/alerts` 进行本地告警测试。
-3. 用本地 D1 创建表：
+1. 在 `worker/` 安装测试依赖：`npm ci`。
+2. 在项目根目录 `.dev.vars` 设置彼此不同的 `SESSION_SECRET`、`BOOTSTRAP_KEY`（各至少 32 个随机字符）和 `APP_ORIGIN=http://127.0.0.1:8787`。不要提交 `.dev.vars`。可选设置 `CERT_EXPIRY_ALERT_DAYS=30` 与本地 webhook URL。此新方案不需要共享 `AGENT_TOKEN`。
+3. 用一次性本地 D1 初始化 schema，并在另一个终端只监听回环地址启动 Wrangler：
 
    ```sh
    ./worker/node_modules/.bin/wrangler d1 execute sentrycloud-monitor-local --local --file=worker/schema.sql --persist-to=.wrangler/local-integration
-   ```
-
-4. 仅监听本机启动：
-
-   ```sh
    ./worker/node_modules/.bin/wrangler dev --local --ip 127.0.0.1 --port 8787 --persist-to=.wrangler/local-integration
    ```
 
-5. 测试 Worker：`cd worker && npm run typecheck && npm test`；测试采集器：`cd agent && python3 -m unittest discover -v`。`tests/local_smoke.py` 是创建测试管理员和监控目标的集成测试，需要全新的一次性本地 D1；它会向 `example.com` 发起 HTTP/TCP 请求，并测试本地模拟 webhook。不要针对真实或生产数据库运行。
+4. 运行 Worker 类型与安全测试：`cd worker && npm run typecheck && npm test`；运行探测器单测：`cd agent && python3 -m unittest discover -v`。如需完整 Smoke 测试，再启动本地 Worker 并运行 `python3 tests/local_smoke.py`；它会创建一次性管理员、注册探测器并访问 `example.com` 执行 HTTP/TCP 集成检查，同时测试本地模拟 webhook；仅对全新本地数据库使用。
 
-本地管理员初始化通过 `/api/bootstrap` 完成，需提供本地 bootstrap key、用户名及至少 12 字符的密码，并带上与 `APP_ORIGIN` 一致的 Origin；具体 API、限制见 `worker/README.md`。采集器配置见 `agent/README.md`。
+本地管理员通过 `/api/bootstrap` 初始化；每台探测器需登录后调用 `POST /api/probes` 注册，将一次性返回的 ID 与令牌配置到 agent 环境变量。详细 API、数据库迁移和最小权限运行步骤见 [`worker/README.md`](worker/README.md) 与 [`agent/README.md`](agent/README.md)。

@@ -1,10 +1,7 @@
-import { connect } from 'cloudflare:sockets';
-
 export interface Env {
   DB: D1Database;
   SESSION_SECRET: string;
   BOOTSTRAP_KEY: string;
-  AGENT_TOKEN: string;
   APP_ORIGIN: string;
   NOTIFY_WEBHOOK_URL?: string;
   TELEGRAM_BOT_TOKEN?: string;
@@ -112,7 +109,6 @@ function certificateAlertThreshold(env: Env) {
 function configError(env: Env) {
   if (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32) throw new Error('invalid SESSION_SECRET configuration');
   if (!env.BOOTSTRAP_KEY || env.BOOTSTRAP_KEY.length < 32) throw new Error('invalid BOOTSTRAP_KEY configuration');
-  if (!env.AGENT_TOKEN || env.AGENT_TOKEN.length < 32) throw new Error('invalid AGENT_TOKEN configuration');
   if (!env.APP_ORIGIN) throw new Error('invalid APP_ORIGIN configuration');
   try {
     new URL(env.APP_ORIGIN);
@@ -146,6 +142,8 @@ function requireString(v: any, n: string, max = 2048) {
 }
 
 async function body(req: Request) {
+  const length = Number(req.headers.get('content-length') || 0);
+  if (length > 1000000) throw new Error('request body too large');
   try {
     return await req.json() as Record<string, any>;
   } catch {
@@ -230,7 +228,8 @@ export function safeEndpoint(raw: string, kind: string) {
     throw new Error('invalid endpoint');
   }
   if (!['http', 'https'].includes(kind) || u.protocol !== `${kind}:`) throw new Error('protocol mismatch');
-  if (u.username || u.password || (u.port && !['80', '443'].includes(u.port))) throw new Error('unsafe endpoint');
+  const expectedPort = kind === 'http' ? '80' : '443';
+  if (u.username || u.password || (u.port && u.port !== expectedPort)) throw new Error('unsafe endpoint');
   const host = u.hostname.toLowerCase();
   if (isDisallowedHost(host)) throw new Error('private or IP-literal host is not allowed');
   return u;
@@ -248,62 +247,25 @@ export function validateTcpTarget(rawHost: string, rawPort: unknown) {
   return { host, port };
 }
 
-function tcpError(e: unknown) {
-  return e instanceof Error ? e.message : String(e);
+function bearerToken(req: Request) {
+  const m = (req.headers.get('authorization') || '').match(/^Bearer\s+([A-Za-z0-9._~-]{32,200})$/i);
+  return m?.[1] || null;
 }
 
-export async function tcpConnectProbe(host: string, port: number, timeout: number) {
-  const started = Date.now();
-  let socket: Socket | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    socket = connect({ hostname: host, port }, { allowHalfOpen: false });
-    const opened = socket.opened.catch((e: unknown) => { throw e; });
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('TCP connect timeout')), Math.min(Math.max(1, timeout), 15000));
-    });
-    await Promise.race([opened, timeoutPromise]);
-    return { ok: true, latency_ms: Date.now() - started, error: null };
-  } catch (e) {
-    return { ok: false, latency_ms: Date.now() - started, error: tcpError(e) };
-  } finally {
-    if (timer) clearTimeout(timer);
-    if (socket) {
-      try { await socket.close(); } catch { /* best effort close */ }
-    }
-  }
+async function tokenDigest(token: string) {
+  return b64u(await crypto.subtle.digest('SHA-256', text(token)));
 }
 
-async function fetchChecked(url: string, timeout: number) {
-  let current = safeEndpoint(url, new URL(url).protocol.slice(0, -1));
-  for (let i = 0; i < 4; i++) {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), Math.min(timeout, 15000));
-    try {
-      const r = await fetch(current, {
-        method: 'GET',
-        redirect: 'manual',
-        signal: ac.signal,
-        headers: { 'user-agent': 'sentrycloud-monitor/1.0' },
-      });
-      if (r.status >= 300 && r.status < 400) {
-        const loc = r.headers.get('location');
-        if (!loc) return r;
-        const next = new URL(loc, current);
-        current = safeEndpoint(next.toString(), next.protocol.slice(0, -1));
-        continue;
-      }
-      return r;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  throw new Error('too many redirects');
-}
-
-function bearer(req: Request, env: Env) {
-  const m = (req.headers.get('authorization') || '').match(/^Bearer\s+(.+)$/i);
-  return !!m && m[1] === env.AGENT_TOKEN;
+async function probeIdentity(req: Request, env: Env) {
+  const token = bearerToken(req);
+  if (!token) throw new Error('invalid probe token');
+  const row = await env.DB.prepare(
+    'SELECT id FROM probes WHERE token_hash=? AND revoked_at IS NULL',
+  ).bind(await tokenDigest(token)).first<{ id: string }>();
+  if (!row) throw new Error('invalid probe token');
+  await env.DB.prepare('UPDATE probes SET last_seen_at=? WHERE id=? AND revoked_at IS NULL')
+    .bind(now(), row.id).run();
+  return row.id;
 }
 
 async function loginAllowed(env: Env, ip: string, user: string) {
@@ -344,6 +306,10 @@ async function notify(env: Env, event: any) {
       message = `Certificate expiring: ${event.hostname} on ${event.agent_id} (${event.days_remaining} days remaining)`;
     } else if (event.type === 'certificate_expired') {
       message = `Certificate expired: ${event.hostname} on ${event.agent_id}`;
+    } else if (event.type === 'certificate_probe_failed') {
+      message = `Certificate probe failed: ${event.hostname} on ${event.agent_id} (${event.error})`;
+    } else if (event.type === 'certificate_probe_recovered') {
+      message = `Certificate probe recovered: ${event.hostname} on ${event.agent_id}`;
     } else if (event.type === 'certificate_recovered') {
       message = `Certificate renewed: ${event.hostname} on ${event.agent_id} (${event.days_remaining} days remaining)`;
     } else {
@@ -361,6 +327,11 @@ async function notify(env: Env, event: any) {
 
 export async function monitorCertificates(env: Env) {
   const threshold = certificateAlertThreshold(env);
+  const certificateErrors = new Set([
+    'certificate_verification_failed', 'certificate_unreadable', 'timeout', 'connection_failed',
+    'tls_failed', 'unsafe_dns_address', 'dns_resolution_failed', 'dns_no_addresses',
+    'invalid_hostname', 'ip_literal_not_allowed', 'invalid_endpoint', 'unsafe_port',
+  ]);
   const rows = await env.DB.prepare(
     'SELECT agent_id,certificates FROM agent_heartbeats WHERE certificates IS NOT NULL',
   ).all<{ agent_id: string; certificates: string | unknown }>();
@@ -376,14 +347,56 @@ export async function monitorCertificates(env: Env) {
     }
     if (!Array.isArray(certificates)) continue;
     const expiries = new Map<string, string>();
+    const observations = new Map<string, string>();
     for (const certificate of certificates) {
-      if (!certificate || typeof certificate.hostname !== 'string' || typeof certificate.expires_at !== 'string') continue;
+      if (!certificate || typeof certificate.hostname !== 'string' || certificate.hostname.length > 255) continue;
       const hostname = certificate.hostname.trim().toLowerCase();
-      if (!hostname) continue;
-      const expiryMs = Date.parse(certificate.expires_at);
-      if (!Number.isFinite(expiryMs)) continue;
-      const currentExpiry = expiries.get(hostname);
-      if (!currentExpiry || expiryMs < Date.parse(currentExpiry)) expiries.set(hostname, certificate.expires_at);
+      if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(hostname)) continue;
+      if (typeof certificate.expires_at === 'string' && Number.isFinite(Date.parse(certificate.expires_at))) {
+        const currentExpiry = expiries.get(hostname);
+        if (!currentExpiry || Date.parse(certificate.expires_at) < Date.parse(currentExpiry)) expiries.set(hostname, certificate.expires_at);
+        observations.set(hostname, 'ok');
+      } else if (typeof certificate.error === 'string' && certificateErrors.has(certificate.error)) {
+        if (observations.get(hostname) !== 'ok') observations.set(hostname, certificate.error);
+      }
+    }
+
+    for (const [hostname, state] of observations) {
+      const previous = await env.DB.prepare(
+        'SELECT state FROM certificate_probe_states WHERE agent_id=? AND hostname=?',
+      ).bind(agent.agent_id, hostname).first<{ state: string }>();
+      if (!previous) {
+        const inserted = await env.DB.prepare(
+          'INSERT OR IGNORE INTO certificate_probe_states(agent_id,hostname,state,changed_at) VALUES(?,?,?,?)',
+        ).bind(agent.agent_id, hostname, state, now()).run();
+        if ((inserted.meta?.changes ?? 0) > 0 && state !== 'ok') {
+          alerts++;
+          await notify(env, { type: 'certificate_probe_failed', agent_id: agent.agent_id, hostname, error: state });
+        }
+      } else if (previous.state !== state) {
+        const updated = await env.DB.prepare(
+          'UPDATE certificate_probe_states SET state=?,changed_at=? WHERE agent_id=? AND hostname=? AND state=?',
+        ).bind(state, now(), agent.agent_id, hostname, previous.state).run();
+        if ((updated.meta?.changes ?? 0) > 0) {
+          if (state !== 'ok') {
+            alerts++;
+            await notify(env, { type: 'certificate_probe_failed', agent_id: agent.agent_id, hostname, error: state });
+          } else if (previous.state !== 'missing') {
+            alerts++;
+            await notify(env, { type: 'certificate_probe_recovered', agent_id: agent.agent_id, hostname });
+          }
+        }
+      }
+    }
+    const previousProbes = await env.DB.prepare(
+      'SELECT hostname,state FROM certificate_probe_states WHERE agent_id=?',
+    ).bind(agent.agent_id).all<{ hostname: string; state: string }>();
+    const seenObservations = new Set(observations.keys());
+    for (const state of previousProbes.results || []) {
+      if (seenObservations.has(state.hostname) || state.state === 'missing') continue;
+      await env.DB.prepare(
+        "UPDATE certificate_probe_states SET state='missing',changed_at=? WHERE agent_id=? AND hostname=? AND state=?",
+      ).bind(now(), agent.agent_id, state.hostname, state.state).run();
     }
 
     for (const [hostname, expiresAt] of expiries) {
@@ -445,48 +458,69 @@ export async function monitorCertificates(env: Env) {
   return alerts;
 }
 
-async function monitor(env: Env) {
+const PROBE_RESULT_ERRORS = new Set([
+  'invalid_hostname', 'ip_literal_not_allowed', 'dns_resolution_failed', 'dns_no_addresses',
+  'unsafe_dns_address', 'invalid_endpoint', 'unsafe_port', 'too_many_redirects', 'timeout',
+  'certificate_verification_failed', 'tls_failed', 'connection_failed', 'unexpected_status',
+  'invalid_check', 'certificate_unreadable',
+]);
+
+async function pullTasks(env: Env, probeId: string, requestedLimit: number) {
+  const limit = Math.min(20, Math.max(1, requestedLimit));
   const rows = await env.DB.prepare(
-    'SELECT c.*,t.name FROM checks c JOIN targets t ON t.id=c.target_id WHERE c.enabled=1',
-  ).all<any>();
-  let checked = 0;
-  for (const c of rows.results || []) {
-    const prev = await env.DB.prepare(
-      'SELECT ok,checked_at FROM check_results WHERE check_id=? ORDER BY checked_at DESC LIMIT 1',
-    ).bind(c.id).first<any>();
-    if (prev && Date.now() - Date.parse(prev.checked_at) < Number(c.interval_seconds) * 1000) continue;
-    let result: { ok: boolean; latency_ms: number; error: string | null };
-    if (c.kind === 'tcp') {
-      try {
-        const target = validateTcpTarget(c.host, c.port);
-        result = await tcpConnectProbe(target.host, target.port, c.timeout_ms);
-      } catch (e) {
-        result = { ok: false, latency_ms: 0, error: tcpError(e) };
-      }
-    } else {
-      let ok = false;
-      let latency_ms = 0;
-      let error: string | null = null;
-      const started = Date.now();
-      try {
-        const r = await fetchChecked(c.url, c.timeout_ms);
-        ok = r.ok && (c.expected_status == null || r.status === c.expected_status);
-      } catch (e) {
-        error = String(e);
-      }
-      latency_ms = Date.now() - started;
-      result = { ok, latency_ms, error };
-    }
-    await env.DB.prepare(
-      'INSERT INTO check_results(check_id,ok,latency_ms,error,checked_at) VALUES(?,?,?,?,?)',
-    ).bind(c.id, result.ok ? 1 : 0, result.latency_ms, result.error, now()).run();
-    checked++;
-    if ((prev && Number(prev.ok) !== Number(result.ok)) || (!prev && !result.ok)) {
-      await notify(env, { type: 'check_state_changed', check_id: c.id, name: c.name, ok: result.ok });
-    }
+    'SELECT c.id,c.kind,c.url,c.host,c.port,c.timeout_ms,c.expected_status ' +
+    'FROM checks c LEFT JOIN (SELECT check_id,MAX(checked_at) AS checked_at FROM check_results GROUP BY check_id) r ON r.check_id=c.id ' +
+    "WHERE c.enabled=1 AND (r.checked_at IS NULL OR julianday(r.checked_at)<=julianday('now')-(c.interval_seconds/86400.0)) " +
+    'AND NOT EXISTS (SELECT 1 FROM probe_task_leases l WHERE l.check_id=c.id AND l.completed_at IS NULL AND l.lease_until>?) ' +
+    "ORDER BY COALESCE(r.checked_at,'1970-01-01T00:00:00.000Z') LIMIT ?",
+  ).bind(Date.now(), limit).all<any>();
+  const tasks = [];
+  for (const check of rows.results || []) {
+    const taskToken = b64u(crypto.getRandomValues(new Uint8Array(32)));
+    const leaseUntil = Date.now() + 600000;
+    const acquired = await env.DB.prepare(
+      'INSERT INTO probe_task_leases(check_id,probe_id,task_token,lease_until,created_at,completed_at) VALUES(?,?,?,?,?,NULL) ' +
+      'ON CONFLICT(check_id) DO UPDATE SET probe_id=excluded.probe_id,task_token=excluded.task_token,' +
+      'lease_until=excluded.lease_until,created_at=excluded.created_at,completed_at=NULL ' +
+      'WHERE probe_task_leases.completed_at IS NOT NULL OR probe_task_leases.lease_until<=? RETURNING check_id',
+    ).bind(check.id, probeId, taskToken, leaseUntil, now(), Date.now()).first<{ check_id: number }>();
+    if (!acquired) continue;
+    tasks.push({ task_token: taskToken, check });
   }
-  const certificate_alerts = await monitorCertificates(env);
-  return { checked, certificate_alerts };
+  return tasks;
+}
+
+async function submitProbeResult(env: Env, probeId: string, payload: Record<string, any>) {
+  const checkId = Number(payload.check_id);
+  const taskToken = requireString(payload.task_token, 'task_token', 128);
+  if (!Number.isSafeInteger(checkId) || checkId < 1 || typeof payload.ok !== 'boolean') throw new Error('invalid probe result');
+  const latency = Number(payload.latency_ms);
+  if (!Number.isInteger(latency) || latency < 0 || latency > 900000) throw new Error('invalid probe result');
+  const error = payload.error == null ? null : requireString(payload.error, 'error', 64);
+  if ((payload.ok && error !== null) || (!payload.ok && (!error || !PROBE_RESULT_ERRORS.has(error)))) {
+    throw new Error('invalid probe result');
+  }
+  const lease = await env.DB.prepare(
+    'SELECT c.id,c.enabled,t.name,l.task_token FROM probe_task_leases l ' +
+    'JOIN checks c ON c.id=l.check_id JOIN targets t ON t.id=c.target_id ' +
+    'WHERE l.check_id=? AND l.probe_id=? AND l.task_token=? AND l.lease_until>?',
+  ).bind(checkId, probeId, taskToken, Date.now()).first<any>();
+  if (!lease || !lease.enabled) throw new Error('invalid or expired task lease');
+  const completed = await env.DB.prepare(
+    'UPDATE probe_task_leases SET completed_at=? WHERE check_id=? AND probe_id=? AND task_token=? AND completed_at IS NULL AND lease_until>?',
+  ).bind(now(), checkId, probeId, taskToken, Date.now()).run();
+  if ((completed.meta?.changes ?? 0) !== 1) throw new Error('task already completed');
+  const previous = await env.DB.prepare(
+    'SELECT ok FROM check_results WHERE check_id=? ORDER BY checked_at DESC LIMIT 1',
+  ).bind(checkId).first<{ ok: number }>();
+  const checkedAt = now();
+  await env.DB.prepare(
+    'INSERT INTO check_results(check_id,ok,latency_ms,error,checked_at) VALUES(?,?,?,?,?)',
+  ).bind(checkId, payload.ok ? 1 : 0, latency, error, checkedAt).run();
+  if ((previous && Number(previous.ok) !== Number(payload.ok)) || (!previous && !payload.ok)) {
+    await notify(env, { type: 'check_state_changed', check_id: checkId, name: lease.name, ok: payload.ok });
+  }
+  return { ok: true, checked_at: checkedAt };
 }
 
 async function route(ctx: Ctx) {
@@ -496,16 +530,28 @@ async function route(ctx: Ctx) {
   if (p === '/health') return json({ ok: true, time: now() });
 
   if (p === '/api/agent/heartbeat' && req.method === 'POST') {
-    if (!bearer(req, env)) throw new Error('invalid agent token');
+    const agent = await probeIdentity(req, env);
     const x = await body(req);
-    const agent = requireString(x.agent_id, 'agent_id', 128);
-    const certificates = x.certificates === undefined ? null : JSON.stringify(x.certificates);
+    if (!x.metrics || typeof x.metrics !== 'object' || Array.isArray(x.metrics)) throw new Error('invalid metrics');
+    if (x.certificates !== undefined && (!Array.isArray(x.certificates) || x.certificates.length > 100)) throw new Error('invalid certificates');
+    const certificates = JSON.stringify(x.certificates || []);
     await env.DB.prepare(
       'INSERT INTO agent_heartbeats(agent_id,ip,metrics,certificates,received_at) VALUES(?,?,?,?,?) ' +
       'ON CONFLICT(agent_id) DO UPDATE SET ip=excluded.ip,metrics=excluded.metrics,' +
       'certificates=excluded.certificates,received_at=excluded.received_at',
     ).bind(agent, req.headers.get('CF-Connecting-IP'), JSON.stringify(x.metrics || {}), certificates, now()).run();
     return json({ ok: true });
+  }
+
+  if (p === '/api/probe/tasks' && req.method === 'GET') {
+    const probeId = await probeIdentity(req, env);
+    const requested = Number(url.searchParams.get('limit') || 10);
+    return json({ tasks: await pullTasks(env, probeId, Number.isFinite(requested) ? requested : 10) });
+  }
+
+  if (p === '/api/probe/results' && req.method === 'POST') {
+    const probeId = await probeIdentity(req, env);
+    return json(await submitProbeResult(env, probeId, await body(req)));
   }
 
   if (p === '/api/bootstrap' && req.method === 'POST') {
@@ -547,7 +593,8 @@ async function route(ctx: Ctx) {
     });
   }
 
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && p !== '/api/agent/heartbeat' && !sameOrigin(req, env)) {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) &&
+      !['/api/agent/heartbeat', '/api/probe/results'].includes(p) && !sameOrigin(req, env)) {
     throw new Error('CSRF origin rejected');
   }
 
@@ -566,6 +613,30 @@ async function route(ctx: Ctx) {
   if (!ctx.user) throw new Error('authentication required');
 
   if (p === '/api/me') return json({ user: { id: ctx.user.id, username: ctx.user.username, totp_enabled: !!ctx.user.totp_enabled } });
+  if (p === '/api/probes' && req.method === 'GET') {
+    return json(await env.DB.prepare(
+      'SELECT id,name,created_at,last_seen_at,revoked_at FROM probes ORDER BY created_at DESC',
+    ).all());
+  }
+  if (p === '/api/probes' && req.method === 'POST') {
+    const x = await body(req);
+    const name = requireString(x.name, 'name', 128);
+    const id = 'probe_' + b64u(crypto.getRandomValues(new Uint8Array(12)));
+    const token = b64u(crypto.getRandomValues(new Uint8Array(32)));
+    await env.DB.prepare('INSERT INTO probes(id,name,token_hash,created_at) VALUES(?,?,?,?)')
+      .bind(id, name, await tokenDigest(token), now()).run();
+    return json({ id, name, token }, 201);
+  }
+  const pm = p.match(/^\/api\/probes\/([A-Za-z0-9_-]{1,128})$/);
+  if (pm && req.method === 'DELETE') {
+    const revokedAt = now();
+    await env.DB.prepare('UPDATE probes SET revoked_at=COALESCE(revoked_at,?) WHERE id=?')
+      .bind(revokedAt, pm[1]).run();
+    await env.DB.prepare('DELETE FROM agent_heartbeats WHERE agent_id=?').bind(pm[1]).run();
+    await env.DB.prepare('UPDATE probe_task_leases SET completed_at=?,lease_until=0 WHERE probe_id=? AND completed_at IS NULL')
+      .bind(revokedAt, pm[1]).run();
+    return json({ ok: true });
+  }
   if (p === '/api/totp/setup' && req.method === 'POST') {
     if (ctx.user.totp_enabled) throw new Error('totp already enabled');
     const secret = randomSecret();
@@ -631,6 +702,9 @@ async function route(ctx: Ctx) {
     }
     const interval = x.interval_seconds == null ? 60 : Number(x.interval_seconds);
     if (!Number.isInteger(interval) || interval < 60 || interval > 31536000) throw new Error('invalid interval_seconds');
+    if (x.expected_status != null && (!Number.isInteger(Number(x.expected_status)) || Number(x.expected_status) < 100 || Number(x.expected_status) > 599)) {
+      throw new Error('invalid expected_status');
+    }
     const r = await env.DB.prepare(
       'INSERT INTO checks(target_id,kind,url,host,port,interval_seconds,timeout_ms,expected_status,enabled,created_at) ' +
       'VALUES(?,?,?,?,?,?,?,?,?,?) RETURNING *',
@@ -676,7 +750,7 @@ async function route(ctx: Ctx) {
 
   if (p === '/api/cron/monitor' && req.method === 'POST') {
     if (req.headers.get('x-cron-key') !== env.BOOTSTRAP_KEY) throw new Error('invalid cron key');
-    return json(await monitor(env));
+    return json({ checked: 0, certificate_alerts: await monitorCertificates(env) });
   }
   throw new Error('not found');
 }
@@ -706,6 +780,6 @@ export default {
   },
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     configError(env);
-    ctx.waitUntil(monitor(env));
+    ctx.waitUntil(monitorCertificates(env));
   },
 };
