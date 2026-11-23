@@ -49,6 +49,7 @@ class AgentTests(unittest.TestCase):
         agent.send_heartbeat(config, {"x": 1}, opener)
         self.assertEqual(captured["timeout"], 7)
         self.assertEqual(captured["request"].get_header("Authorization"), "Bearer secret-token")
+        self.assertEqual(captured["request"].get_header("User-agent"), "sentrycloud-monitor-probe/1.0")
         self.assertEqual(json.loads(captured["request"].data),
                          {"agent_id": "node-1", "metrics": {"x": 1}, "certificates": []})
 
@@ -99,6 +100,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(calls[1].full_url, "https://monitor.example/api/probe/results")
         for request in calls:
             self.assertEqual(request.get_header("Authorization"), "Bearer probe-secret-token")
+            self.assertEqual(request.get_header("User-agent"), "sentrycloud-monitor-probe/1.0")
         self.assertEqual(json.loads(calls[1].data), {
             "check_id": 17, "task_token": "lease-token", "ok": False,
             "latency_ms": 12, "error": "certificate_verification_failed"

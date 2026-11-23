@@ -172,7 +172,8 @@ def send_heartbeat(config: Config, metrics: Dict[str, Any], opener: Callable = _
                "certificates": probe_certificates(config.cert_hosts, config.timeout)
                if config.cert_hosts else []}
     request = urllib.request.Request(config.url, data=json.dumps(payload, separators=(",", ":")).encode(),
-                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + config.token},
+                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + config.token,
+                                              "User-Agent": "sentrycloud-monitor-probe/1.0"},
                                      method="POST")
     with opener(request, timeout=config.timeout) as response:
         if not 200 <= response.status < 300:
@@ -187,7 +188,8 @@ def _api_url(config: Config, path: str) -> str:
 def _api_json(config: Config, path: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None,
               opener: Callable = _safe_urlopen) -> Any:
     data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
-    headers = {"Authorization": "Bearer " + config.token, "Accept": "application/json"}
+    headers = {"Authorization": "Bearer " + config.token, "Accept": "application/json",
+               "User-Agent": "sentrycloud-monitor-probe/1.0"}
     if data is not None:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(_api_url(config, path), data=data, headers=headers, method=method)
