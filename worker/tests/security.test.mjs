@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { build } from 'esbuild';
 
 // Bundle the actual Worker code and replace only the Cloudflare socket transport.
@@ -418,4 +418,36 @@ test('certificate probe validation failures alert once and recover when a valid 
     assert.equal(sent.at(-1).type, 'certificate_probe_recovered');
     assert.equal(await worker.monitorCertificates(data.env), 0);
   });
+});
+
+
+test('TOTP setup reuses an existing pending enrollment secret without rewriting it', async () => {
+  const pendingSecret = 'ABCDEFGHABCDEFGHABCDEFGHABCDEFGH';
+  const user = { id: 1, username: 'admin', password_hash: 'unused', totp_secret: pendingSecret, totp_enabled: 0 };
+  let writes = 0;
+  const db = {
+    prepare(sql) {
+      let values = [];
+      const statement = {
+        bind(...args) { values = args; return statement; },
+        async first() {
+          assert.match(sql, /^SELECT id,username,password_hash,totp_secret,totp_enabled FROM users WHERE id=/);
+          assert.equal(values[0], 1);
+          return user;
+        },
+        async run() { writes += 1; throw new Error('pending setup must not overwrite the database'); },
+      };
+      return statement;
+    },
+  };
+  const payload = Buffer.from(JSON.stringify({ sub: 1, exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url');
+  const signature = createHmac('sha256', env.SESSION_SECRET).update(payload).digest('base64url');
+  const response = await worker.default.fetch(new Request('https://monitor.example/api/totp/setup', {
+    method: 'POST', headers: { Origin: env.APP_ORIGIN, Cookie: `sc_session=${payload}.${signature}` },
+  }), { ...env, DB: db });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.secret, pendingSecret);
+  assert.match(body.otpauth_uri, new RegExp(`secret=${pendingSecret}`));
+  assert.equal(writes, 0);
 });

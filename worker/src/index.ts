@@ -639,8 +639,10 @@ async function route(ctx: Ctx) {
   }
   if (p === '/api/totp/setup' && req.method === 'POST') {
     if (ctx.user.totp_enabled) throw new Error('totp already enabled');
-    const secret = randomSecret();
-    await env.DB.prepare('UPDATE users SET totp_secret=?,totp_enabled=0 WHERE id=?').bind(secret, ctx.user.id).run();
+    const secret = ctx.user.totp_secret || randomSecret();
+    if (!ctx.user.totp_secret) {
+      await env.DB.prepare('UPDATE users SET totp_secret=?,totp_enabled=0 WHERE id=?').bind(secret, ctx.user.id).run();
+    }
     const issuer = encodeURIComponent('SentryCloud Monitor');
     const label = encodeURIComponent(ctx.user.username);
     return json({ secret, otpauth_uri: `otpauth://totp/${issuer}:${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30` });

@@ -19,7 +19,7 @@
 - `POST /api/bootstrap`：body `{key, username, password}`，仅空库；密码至少 12 字符，要求同源 `Origin`。
 - `POST /api/login`：body `{username,password,totp?}`，要求同源 `Origin`；按 `IP+username` 限速最多 10 次/15 分钟。仍需要外层 Access/MFA 与更强防暴力保护。
 - `GET /api/me`、`POST /api/logout`；管理员 cookie 为 Secure、HttpOnly、SameSite=Strict。
-- `POST /api/totp/setup|enable|disable`：启用 TOTP 后不允许无验证覆盖密钥；停用要求密码与当前 TOTP。
+- `POST /api/totp/setup|enable|disable`：启用 TOTP 后不允许无验证覆盖密钥；待绑定期间重复请求会返回现有密钥，不会让页面刷新或部署更新使原绑定二维码失效；停用要求密码与当前 TOTP。
 - `POST /api/probes`（管理员 session、同源 `Origin`）：body `{name}`。创建独立探测器并仅一次返回 `{id,name,token}`；token 不可查询回。
 - `GET /api/probes`（管理员 session）：列出探测器名称、上线时间、撤销状态，不含令牌。
 - `DELETE /api/probes/:id`（管理员 session、同源 `Origin`）：撤销该探测器令牌。
