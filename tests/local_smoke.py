@@ -17,6 +17,7 @@ import struct
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -79,6 +80,12 @@ assert request('GET', '/health')['ok']
 assert b'SentryCloud' in request('GET', '/')
 request('POST', '/api/bootstrap', {'key': bootstrap_key, 'username': username, 'password': password}, expected=(201,))
 request('POST', '/api/login', {'username': username, 'password': password}, headers={'Origin': 'https://invalid.example'}, expected=(400, 403))
+rate_headers = {'CF-Connecting-IP': '203.0.113.9'}
+for i in range(10):
+    malformed = {'username': username} if i % 2 == 0 else {'username': username, 'password': {'invalid': True}}
+    request('POST', '/api/login', malformed, headers=rate_headers, expected=(403,))
+limited = request('POST', '/api/login', {'username': username}, headers=rate_headers, expected=(429,))
+assert limited['error'] == 'login rate limit exceeded'
 request('POST', '/api/login', {'username': username, 'password': password})
 assert request('GET', '/api/me')['user']['username'] == username
 setup = request('POST', '/api/totp/setup')
@@ -101,12 +108,39 @@ send_heartbeat(Config(url=BASE + '/api/agent/heartbeat', token=agent_token,
                       insecure_local=True, agent_id='local-test'), metrics)
 rows = request('GET', '/api/agents')['results']
 assert any(r['agent_id'] == 'local-test' and 'memory' in json.loads(r['metrics']) for r in rows)
+cert_expiry_soon = (datetime.now(timezone.utc) + timedelta(days=15)).isoformat().replace('+00:00', 'Z')
+cert_expiry_later = (datetime.now(timezone.utc) + timedelta(days=60)).isoformat().replace('+00:00', 'Z')
 request('POST', '/api/agent/heartbeat', {'agent_id': 'cert-test', 'metrics': {},
-    'certificates': [{'hostname': 'example.com', 'expires_at': '2030-01-01T00:00:00Z'}]},
+    'certificates': [
+        {'hostname': 'example.com', 'expires_at': cert_expiry_soon},
+        {'hostname': 'EXAMPLE.COM', 'expires_at': cert_expiry_later},
+    ]},
     headers={'Authorization': 'Bearer ' + agent_token})
 rows = request('GET', '/api/agents')['results']
 assert any(r['agent_id'] == 'cert-test' and json.loads(r['certificates'])[0]['hostname'] == 'example.com' for r in rows)
+alert_result = request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})
+assert alert_result['certificate_alerts'] == 1, 'near-expiry certificate did not trigger one alert'
+assert any(e.get('type') == 'certificate_expiring' and e.get('hostname') == 'example.com' for e in events), 'near-expiry webhook not delivered'
+assert request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})['certificate_alerts'] == 0, 'repeated cron duplicated an unchanged alert'
+
+request('POST', '/api/agent/heartbeat', {'agent_id': 'cert-test', 'metrics': {}, 'certificates': []},
+        headers={'Authorization': 'Bearer ' + agent_token})
+assert request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})['certificate_alerts'] == 0
+assert not any(e.get('type') == 'certificate_recovered' for e in events), 'missing certificate was incorrectly reported as recovered'
+request('POST', '/api/agent/heartbeat', {'agent_id': 'cert-test', 'metrics': {},
+    'certificates': [{'hostname': 'example.com', 'expires_at': cert_expiry_soon}]},
+    headers={'Authorization': 'Bearer ' + agent_token})
+assert request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})['certificate_alerts'] == 1
+assert sum(e.get('type') == 'certificate_expiring' for e in events) == 2, 'reappearing warning certificate was not re-alerted'
+
+cert_expiry_renewed = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat().replace('+00:00', 'Z')
+request('POST', '/api/agent/heartbeat', {'agent_id': 'cert-test', 'metrics': {},
+    'certificates': [{'hostname': 'example.com', 'expires_at': cert_expiry_renewed}]},
+    headers={'Authorization': 'Bearer ' + agent_token})
+assert request('POST', '/api/cron/monitor', headers={'x-cron-key': bootstrap_key})['certificate_alerts'] == 1
+assert any(e.get('type') == 'certificate_recovered' and e.get('hostname') == 'example.com' for e in events), 'certificate renewal webhook not delivered'
 print('PASS: rejected unauthorized agent, real local metrics heartbeat, certificate payload persisted')
+print('PASS: malformed login limit, duplicate-host alert dedupe, missing/reappearing certificate, and renewal recovery')
 
 target = request('POST', '/api/targets', {'name': 'Local test target', 'host': 'example.com'}, expected=(201,))
 tid = target['id']
