@@ -1,0 +1,17 @@
+# Local dependencies and runtime state
+node_modules/
+.wrangler/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+coverage/
+dist/
+
+# Never commit credentials or environment files
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+*.key
+*.pem
+.DS_Store

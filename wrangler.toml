@@ -1,0 +1,19 @@
+# Local-development template only. The D1 id is a placeholder, not a real resource.
+# No production deployment or GitHub integration is created by this file.
+name = "sentrycloud-monitor-local"
+main = "worker/src/index.ts"
+compatibility_date = "2025-07-18"
+workers_dev = false
+preview_urls = false
+
+[assets]
+directory = "./web"
+binding = "ASSETS"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sentrycloud-monitor-local"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[triggers]
+crons = ["* * * * *"]
