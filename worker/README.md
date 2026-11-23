@@ -11,7 +11,7 @@
 
 不再需要全局 `AGENT_TOKEN`。每台 Linux 探测器由管理员单独注册，Worker 仅存令牌 SHA-256 摘要，可逐台撤销。探测器以 HTTPS 主动拉取任务，因此无需开放探测器入站端口，也不向探测器提供 Cloudflare API、D1 或通知渠道凭据。
 
-新建数据库使用 `schema.sql`。已有数据库依次按原项目升级说明完成证书列/证书告警状态迁移后，再执行一次 `migration-probe-security.sql`，创建 `probes`、`probe_task_leases` 与 `certificate_probe_states`。先备份 D1；不要把迁移文件当作可重复全量重置操作。
+新建数据库使用 `schema.sql`。已有数据库依次按原项目升级说明完成证书列/证书告警状态迁移后，再执行一次 `migration-probe-security.sql`，创建 `probes`、`probe_task_leases` 与 `certificate_probe_states`；然后执行一次 `migration-appearance-settings.sql`，只新增单行主题配置表，不改动既有数据。先备份 D1；不要把迁移文件当作可重复全量重置操作。
 
 ## 认证与端点
 
@@ -19,6 +19,7 @@
 - `POST /api/bootstrap`：body `{key, username, password}`，仅空库；密码至少 12 字符，要求同源 `Origin`。
 - `POST /api/login`：body `{username,password,totp?}`，要求同源 `Origin`；按 `IP+username` 限速最多 10 次/15 分钟。仍需要外层 Access/MFA 与更强防暴力保护。
 - `GET /api/me`、`POST /api/logout`；管理员 cookie 为 Secure、HttpOnly、SameSite=Strict。
+- `GET/PUT /api/settings/appearance`：仅管理员 session 可读写，写入要求同源 Origin；以 D1 单行配置保存主题、HTTPS 背景 URL、面板透明度/模糊度、自定义 CSS 与 Script。背景 URL 最多 2048 字符且必须 HTTPS；CSS/Script 分别限制 20,000/12,000 字符。Script 仅在前端确认 `/api/me` 成功且管理员面板已显示后执行，登录页/匿名页面不会加载用户代码；它仍可修改认证界面并代表当前会话发出操作，只能保存完全信任的代码。
 - `POST /api/totp/setup|enable|disable`：启用 TOTP 后不允许无验证覆盖密钥；待绑定期间重复请求会返回现有密钥，不会让页面刷新或部署更新使原绑定二维码失效；停用要求密码与当前 TOTP。
 - `POST /api/probes`（管理员 session、同源 `Origin`）：body `{name}`。创建独立探测器并仅一次返回 `{id,name,token}`；token 不可查询回。
 - `GET /api/probes`（管理员 session）：列出探测器名称、上线时间、撤销状态，不含令牌。

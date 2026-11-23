@@ -151,6 +151,73 @@ async function body(req: Request) {
   }
 }
 
+export type AppearanceSettings = {
+  theme: 'default' | 'custom';
+  backgroundImageUrl: string;
+  panelOpacity: number;
+  panelBlurPx: number;
+  customCss: string;
+  customScript: string;
+};
+
+export const DEFAULT_APPEARANCE: AppearanceSettings = {
+  theme: 'default',
+  backgroundImageUrl: '',
+  panelOpacity: 0.74,
+  panelBlurPx: 18,
+  customCss: '',
+  customScript: '',
+};
+
+export function validateAppearanceSettings(value: unknown): AppearanceSettings {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid appearance settings');
+  const input = value as Record<string, unknown>;
+  const allowed = new Set(['theme', 'backgroundImageUrl', 'panelOpacity', 'panelBlurPx', 'customCss', 'customScript']);
+  if (Object.keys(input).some(key => !allowed.has(key))) throw new Error('invalid appearance field');
+  if (input.theme !== 'default' && input.theme !== 'custom') throw new Error('invalid theme');
+
+  if (typeof input.backgroundImageUrl !== 'string' || input.backgroundImageUrl.length > 2048) {
+    throw new Error('invalid background image URL');
+  }
+  const backgroundImageUrl = input.backgroundImageUrl.trim();
+  if (backgroundImageUrl) {
+    let imageUrl: URL;
+    try { imageUrl = new URL(backgroundImageUrl); } catch { throw new Error('invalid background image URL'); }
+    if (imageUrl.protocol !== 'https:' || imageUrl.username || imageUrl.password) {
+      throw new Error('background image URL must use HTTPS and cannot contain username or password');
+    }
+  }
+
+  const panelOpacity = Number(input.panelOpacity);
+  if (!Number.isFinite(panelOpacity) || panelOpacity < 0.45 || panelOpacity > 0.92) {
+    throw new Error('invalid panel opacity');
+  }
+  const panelBlurPx = Number(input.panelBlurPx);
+  if (!Number.isInteger(panelBlurPx) || panelBlurPx < 0 || panelBlurPx > 32) {
+    throw new Error('invalid panel blur');
+  }
+  if (typeof input.customCss !== 'string' || input.customCss.length > 20000) throw new Error('custom CSS too large');
+  if (typeof input.customScript !== 'string' || input.customScript.length > 12000) throw new Error('custom Script too large');
+  let customScript = input.customScript;
+  const scriptWrapper = customScript.match(/^\s*<script(?:\s+([^>]*)?)?>([\s\S]*)<\/script>\s*$/i);
+  if (scriptWrapper) {
+    if (/\bsrc\s*=/i.test(scriptWrapper[1] || '')) throw new Error('external Script URLs are not allowed');
+    customScript = scriptWrapper[2];
+  } else if (/<\/?script\b/i.test(customScript)) {
+    throw new Error('invalid custom Script markup');
+  }
+  if (customScript.length > 12000) throw new Error('custom Script too large');
+
+  return {
+    theme: input.theme,
+    backgroundImageUrl,
+    panelOpacity,
+    panelBlurPx,
+    customCss: input.customCss,
+    customScript,
+  };
+}
+
 export function certificateExpiryState(expiresAt: string, nowMs = Date.now(), thresholdDays = 30) {
   const expiryMs = Date.parse(expiresAt);
   if (!Number.isFinite(expiryMs)) return null;
@@ -613,6 +680,26 @@ async function route(ctx: Ctx) {
   if (!ctx.user) throw new Error('authentication required');
 
   if (p === '/api/me') return json({ user: { id: ctx.user.id, username: ctx.user.username, totp_enabled: !!ctx.user.totp_enabled } });
+  if (p === '/api/settings/appearance' && req.method === 'GET') {
+    const row = await env.DB.prepare('SELECT config_json FROM appearance_settings WHERE id=1')
+      .first<{ config_json: string }>();
+    let appearance = DEFAULT_APPEARANCE;
+    if (row?.config_json) {
+      try { appearance = validateAppearanceSettings(JSON.parse(row.config_json)); } catch { /* use safe defaults */ }
+    }
+    return json({ appearance }, 200, { 'cache-control': 'no-store' });
+  }
+  if (p === '/api/settings/appearance' && req.method === 'PUT') {
+    const length = Number(req.headers.get('content-length') || 0);
+    if (length > 50000) throw new Error('appearance settings too large');
+    const x = await body(req);
+    const appearance = validateAppearanceSettings(x.appearance);
+    await env.DB.prepare(
+      'INSERT INTO appearance_settings(id,config_json,updated_at,updated_by) VALUES(1,?,?,?) ' +
+      'ON CONFLICT(id) DO UPDATE SET config_json=excluded.config_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by',
+    ).bind(JSON.stringify(appearance), now(), ctx.user.id).run();
+    return json({ ok: true, appearance }, 200, { 'cache-control': 'no-store' });
+  }
   if (p === '/api/probes' && req.method === 'GET') {
     return json(await env.DB.prepare(
       'SELECT id,name,created_at,last_seen_at,revoked_at FROM probes ORDER BY created_at DESC',

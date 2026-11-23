@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <div class="ambient-scene" aria-hidden="true"><span class="scene-orb orb-a"></span><span class="scene-orb orb-b"></span><span class="scene-orb orb-c"></span><span class="scene-grid"></span></div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <section id="login-view" class="auth-shell" aria-labelledby="login-title">
     <div class="auth-card">
@@ -18,7 +19,7 @@
       <form id="login-form" class="stack-form">
         <label>用户名<input name="username" autocomplete="username" required></label>
         <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
-        <label>TOTP 验证码 <span class="optional">（未启用可留空）</span><input name="totp" inputmode="numeric" autocomplete="one-time-code" maxlength="6"></label>
+        <label><span>TOTP 验证码 <span class="optional">（未启用可留空）</span></span><input name="totp" inputmode="numeric" autocomplete="one-time-code" maxlength="6"></label>
         <button class="primary full" type="submit">登录 <span aria-hidden="true">→</span></button>
       </form>
       <p id="login-error" class="form-error" role="alert"></p>
@@ -47,12 +48,33 @@
       <div id="page-servers" class="page-view hidden"><div class="page-intro"><div><p class="muted">采集代理与主机资源</p><h2>服务器指标</h2></div></div><div id="servers-list" class="cards-grid"></div></div>
       <div id="page-sites" class="page-view hidden"><div class="page-intro"><div><p class="muted">HTTP / HTTPS / TCP 监控目标</p><h2>域名与站点</h2></div><button id="add-target-btn" class="primary">+ 新建目标</button></div><div id="targets-table" class="panel table-wrap"></div></div>
       <div id="page-history" class="page-view hidden"><div class="page-intro"><div><p class="muted">同一 check 的响应时间与可用性趋势</p><h2>历史记录</h2></div></div><section class="panel"><div class="panel-head"><h2>响应时间</h2><span class="muted">实际历史记录</span></div><div id="history-chart" class="chart-wrap"></div></section></div>
-      <div id="page-settings" class="page-view hidden"><div class="page-intro"><div><p class="muted">访问控制与安全策略</p><h2>设置</h2></div></div><section class="panel settings-panel"><div class="settings-heading"><div class="setting-icon">⌁</div><div><h2>双因素认证（TOTP）</h2><p class="muted">为管理员账户增加一次性验证码保护。</p></div><span id="totp-status" class="pill neutral">未加载</span></div><div id="totp-content" class="totp-content"></div></section></div>
+      <div id="page-settings" class="page-view hidden">
+        <div class="page-intro"><div><p class="muted">访问控制与外观自定义</p><h2>设置</h2></div></div>
+        <section class="panel settings-panel">
+          <div class="settings-heading"><div class="setting-icon">⌁</div><div><h2>双因素认证（TOTP）</h2><p class="muted">为管理员账户增加一次性验证码保护。</p></div><span id="totp-status" class="pill neutral">未加载</span></div>
+          <div id="totp-content" class="totp-content"></div>
+        </section>
+        <section class="panel appearance-panel" aria-labelledby="appearance-title">
+          <div class="settings-heading"><div class="setting-icon appearance-icon">◈</div><div><h2 id="appearance-title">前端主题风格</h2><p class="muted">背景、玻璃面板与自定义样式。</p></div><span id="appearance-status" class="pill neutral">未加载</span></div>
+          <form id="appearance-form" class="appearance-form">
+            <div class="appearance-grid">
+              <label>主题<select id="appearance-theme"><option value="default">默认玻璃态（SentryCloud）</option><option value="custom">完全自定义 CSS（Custom Theme）</option></select><span class="field-help">自定义 CSS 仅在选择 Custom Theme 时启用。</span></label>
+              <label>面板透明度 <output id="appearance-opacity-value" for="appearance-opacity">0.74</output><input id="appearance-opacity" type="range" min="0.45" max="0.92" step="0.01"><span class="field-help">控制仪表盘卡片与面板底色的不透明度。</span></label>
+              <label>毛玻璃模糊 <output id="appearance-blur-value" for="appearance-blur">18 px</output><input id="appearance-blur" type="range" min="0" max="32" step="1"><span class="field-help">调整背景透过面板时的模糊程度。</span></label>
+              <label class="appearance-wide">自定义背景图片 URL<input id="appearance-background" type="url" maxlength="2048" autocomplete="url" placeholder="https://example.com/background.jpg"><span class="field-help">只接受 HTTPS 图片地址；清空后恢复内置背景。浏览器会直接从该地址加载图片。</span><img id="appearance-background-preview" class="background-preview hidden" alt="自定义背景图片预览"></label>
+              <label id="appearance-css-field" class="appearance-wide hidden">自定义 CSS 代码<textarea id="appearance-css" maxlength="20000" rows="8" spellcheck="false" placeholder="#app .panel { background: rgba(12, 18, 34, .52); border-color: rgba(255,255,255,.18); }"></textarea><span class="field-help">仅在 Custom Theme 下应用。代码只在管理员已认证时加载；请谨慎使用外部资源 URL。</span></label>
+              <label class="appearance-wide">自定义 Script 注入（任意 JavaScript）<textarea id="appearance-script" maxlength="12000" rows="8" spellcheck="false" placeholder="// 在已登录的 SentryCloud 管理面板中运行\nconsole.log('SentryCloud theme loaded');"></textarea><span class="script-warning" role="note"><strong>安全警告：</strong>这段代码会在已认证的管理面板中执行，可修改界面、读取当前页面可见数据并以当前会话发起操作。只保存你完全信任的代码；保存后在下一次加载已登录面板时运行，绝不在登录页或未登录页面执行。</span></label>
+            </div>
+            <div class="appearance-actions"><button id="appearance-preview" type="button" class="outline-button">预览当前输入</button><button id="appearance-reset" type="button" class="ghost-button">恢复默认并保存</button><button class="primary" type="submit">保存外观</button></div>
+          </form>
+        </section>
+      </div>
     </main>
   </div>
-    <dialog id="target-dialog"><form id="target-form" method="dialog"><div class="dialog-head"><div><p class="eyebrow">NEW TARGET</p><h2>新建监控目标</h2></div><button type="button" class="icon-button" id="close-dialog" aria-label="关闭">×</button></div><label>名称<input name="name" required maxlength="100" placeholder="例如：主站"></label><label>检查类型<select id="check-kind" name="kind"><option value="http">HTTP / HTTPS</option><option value="tcp">TCP</option></select></label><div id="http-fields"><label>地址<input id="target-url" name="url" type="url" required placeholder="https://example.com"></label></div><div id="tcp-fields" class="hidden"><label>Host<input id="target-host" name="host" placeholder="db.example.com"></label><label>Port<input id="target-port" name="port" type="number" min="1" max="65535" placeholder="443"></label></div><p class="muted">创建后会自动建立对应 check。TCP 检查需后端支持。</p><div class="dialog-actions"><button type="button" class="outline-button" id="cancel-dialog">取消</button><button class="primary" type="submit">创建目标</button></div></form></dialog>
-    <dialog id="totp-dialog"><form id="totp-form" method="dialog"><div class="dialog-head"><div><p class="eyebrow">SECURITY</p><h2 id="totp-dialog-title">TOTP 操作</h2></div><button type="button" class="icon-button" onclick="this.closest('dialog').close()" aria-label="关闭">×</button></div><label id="totp-password-field" class="hidden">当前密码<input id="totp-password" type="password" autocomplete="current-password"></label><label>6 位验证码<input id="totp-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required></label><div class="dialog-actions"><button type="button" class="outline-button" onclick="this.closest('dialog').close()">取消</button><button class="primary" type="submit">确认</button></div></form></dialog>
+  <dialog id="target-dialog"><form id="target-form" method="dialog"><div class="dialog-head"><div><p class="eyebrow">NEW TARGET</p><h2>新建监控目标</h2></div><button type="button" class="icon-button" id="close-dialog" aria-label="关闭">×</button></div><label>名称<input name="name" required maxlength="100" placeholder="例如：主站"></label><label>检查类型<select id="check-kind" name="kind"><option value="http">HTTP / HTTPS</option><option value="tcp">TCP</option></select></label><div id="http-fields"><label>地址<input id="target-url" name="url" type="url" required placeholder="https://example.com"></label></div><div id="tcp-fields" class="hidden"><label>Host<input id="target-host" name="host" placeholder="db.example.com"></label><label>Port<input id="target-port" name="port" type="number" min="1" max="65535" placeholder="443"></label></div><p class="muted">创建后会自动建立对应 check。TCP 检查需后端支持。</p><div class="dialog-actions"><button type="button" class="outline-button" id="cancel-dialog">取消</button><button class="primary" type="submit">创建目标</button></div></form></dialog>
+  <dialog id="totp-dialog"><form id="totp-form" method="dialog"><div class="dialog-head"><div><p class="eyebrow">SECURITY</p><h2 id="totp-dialog-title">TOTP 操作</h2></div><button type="button" class="icon-button" onclick="this.closest('dialog').close()" aria-label="关闭">×</button></div><label id="totp-password-field" class="hidden">当前密码<input id="totp-password" type="password" autocomplete="current-password"></label><label>6 位验证码<input id="totp-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required></label><div class="dialog-actions"><button type="button" class="outline-button" onclick="this.closest('dialog').close()">取消</button><button class="primary" type="submit">确认</button></div></form></dialog>
   <script src="vendor/qrcode.js"></script>
   <script src="app.js"></script>
+  <script src="appearance.js"></script>
 </body>
 </html>

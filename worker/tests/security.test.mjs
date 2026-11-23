@@ -451,3 +451,123 @@ test('TOTP setup reuses an existing pending enrollment secret without rewriting 
   assert.match(body.otpauth_uri, new RegExp(`secret=${pendingSecret}`));
   assert.equal(writes, 0);
 });
+
+
+function adminSessionCookie(userId = 1) {
+  const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url');
+  const signature = createHmac('sha256', env.SESSION_SECRET).update(payload).digest('base64url');
+  return `sc_session=${payload}.${signature}`;
+}
+
+function appearanceRequest(path, { method = 'GET', cookie = adminSessionCookie(), body } = {}) {
+  const headers = { Cookie: cookie };
+  if (method !== 'GET') {
+    headers.Origin = env.APP_ORIGIN;
+    headers['Content-Type'] = 'application/json';
+  }
+  return new Request(`https://monitor.example${path}`, {
+    method,
+    headers,
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+}
+
+test('appearance settings are administrator-only and reject unauthenticated reads and writes', async () => {
+  const noDbCalls = { prepare() { throw new Error('unauthenticated appearance request reached D1'); } };
+  const unauthenticatedGet = await worker.default.fetch(appearanceRequest('/api/settings/appearance', { cookie: '' }), { ...env, DB: noDbCalls });
+  assert.equal(unauthenticatedGet.status, 401);
+  const unauthenticatedPut = await worker.default.fetch(appearanceRequest('/api/settings/appearance', {
+    method: 'PUT', cookie: '', body: { appearance: worker.DEFAULT_APPEARANCE },
+  }), { ...env, DB: noDbCalls });
+  assert.equal(unauthenticatedPut.status, 401);
+});
+
+test('appearance settings persist in the singleton D1 row and validate URLs and input limits', async () => {
+  let stored = null;
+  let updatedBy = null;
+  const db = {
+    prepare(sql) {
+      let values = [];
+      const statement = {
+        bind(...args) { values = args; return statement; },
+        async first() {
+          if (sql.startsWith('SELECT id,username,password_hash,totp_secret,totp_enabled FROM users WHERE id=')) {
+            return { id: 1, username: 'admin', password_hash: 'unchanged', totp_secret: null, totp_enabled: 0 };
+          }
+          if (sql.startsWith('SELECT config_json FROM appearance_settings WHERE id=1')) {
+            return stored ? { config_json: stored } : null;
+          }
+          throw new Error(`unexpected first query: ${sql}`);
+        },
+        async run() {
+          if (sql.startsWith('INSERT INTO appearance_settings')) {
+            stored = values[0];
+            updatedBy = values[2];
+            return { meta: { changes: 1 } };
+          }
+          throw new Error(`unexpected run query: ${sql}`);
+        },
+      };
+      return statement;
+    },
+  };
+  const appearanceEnv = { ...env, DB: db };
+  const defaultsResponse = await worker.default.fetch(appearanceRequest('/api/settings/appearance'), appearanceEnv);
+  assert.equal(defaultsResponse.status, 200);
+  assert.deepEqual((await defaultsResponse.json()).appearance, worker.DEFAULT_APPEARANCE);
+  assert.equal(stored, null);
+
+  const configured = {
+    theme: 'custom',
+    backgroundImageUrl: 'https://images.example.test/wallpaper.jpg?size=large',
+    panelOpacity: 0.58,
+    panelBlurPx: 12,
+    customCss: '#app .panel { border-radius: 18px; }',
+    customScript: 'console.log("authenticated only");',
+  };
+  const savedResponse = await worker.default.fetch(appearanceRequest('/api/settings/appearance', {
+    method: 'PUT', body: { appearance: configured },
+  }), appearanceEnv);
+  assert.equal(savedResponse.status, 200);
+  assert.deepEqual((await savedResponse.json()).appearance, configured);
+  assert.equal(updatedBy, 1);
+  const reloaded = await worker.default.fetch(appearanceRequest('/api/settings/appearance'), appearanceEnv);
+  assert.deepEqual((await reloaded.json()).appearance, configured);
+
+  for (const backgroundImageUrl of [
+    'http://images.example.test/wallpaper.jpg',
+    'javascript:alert(1)',
+    'https://user:password@images.example.test/wallpaper.jpg',
+    `https://images.example.test/${'a'.repeat(2050)}`,
+  ]) {
+    const invalidUrl = await worker.default.fetch(appearanceRequest('/api/settings/appearance', {
+      method: 'PUT', body: { appearance: { ...configured, backgroundImageUrl } },
+    }), appearanceEnv);
+    assert.equal(invalidUrl.status, 400, backgroundImageUrl.slice(0, 80));
+  }
+
+  const largeCss = await worker.default.fetch(appearanceRequest('/api/settings/appearance', {
+    method: 'PUT', body: { appearance: { ...configured, customCss: 'x'.repeat(20001) } },
+  }), appearanceEnv);
+  assert.equal(largeCss.status, 400);
+  const largeScript = await worker.default.fetch(appearanceRequest('/api/settings/appearance', {
+    method: 'PUT', body: { appearance: { ...configured, customScript: 'x'.repeat(12001) } },
+  }), appearanceEnv);
+  assert.equal(largeScript.status, 400);
+  const badOpacity = await worker.default.fetch(appearanceRequest('/api/settings/appearance', {
+    method: 'PUT', body: { appearance: { ...configured, panelOpacity: 1 } },
+  }), appearanceEnv);
+  assert.equal(badOpacity.status, 400);
+  const badTheme = await worker.default.fetch(appearanceRequest('/api/settings/appearance', {
+    method: 'PUT', body: { appearance: { ...configured, theme: 'theme6<script>' } },
+  }), appearanceEnv);
+  assert.equal(badTheme.status, 400);
+
+  const oversizedRequest = await worker.default.fetch(new Request('https://monitor.example/api/settings/appearance', {
+    method: 'PUT',
+    headers: { Cookie: adminSessionCookie(), Origin: env.APP_ORIGIN, 'Content-Type': 'application/json', 'Content-Length': '50001' },
+    body: '{}',
+  }), appearanceEnv);
+  assert.equal(oversizedRequest.status, 400);
+  assert.deepEqual(JSON.parse(stored), configured, 'invalid updates must not modify the saved row');
+});
